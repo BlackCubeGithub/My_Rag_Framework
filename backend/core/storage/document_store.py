@@ -1,38 +1,67 @@
 """
 Document Store
-Manages document metadata and chunks in file system
+Manages document metadata and chunks using SQLite
 """
+import sqlite3
 import json
 import uuid
 from pathlib import Path
 from typing import Optional
-import structlog
 from datetime import datetime
+import structlog
 
 logger = structlog.get_logger()
 
+_DB_PATH = "./data/documents/store.db"
+
+
+def _get_connection() -> sqlite3.Connection:
+    """Get a thread-safe SQLite connection with foreign keys enabled."""
+    conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _init_db():
+    """Initialize database schema."""
+    conn = _get_connection()
+    try:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS documents (
+                document_id TEXT PRIMARY KEY,
+                file_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks (
+                chunk_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (document_id) REFERENCES documents(document_id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_document_id
+                ON chunks(document_id);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
 
 class DocumentStore:
-    """File-based document metadata store"""
+    """SQLite-based document and chunk store."""
+
+    _db_initialized = False
 
     def __init__(self, storage_dir: str = "./data/documents"):
-        self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self.index_file = self.storage_dir / "index.json"
-        self._load_index()
-
-    def _load_index(self):
-        """Load or initialize the document index"""
-        if self.index_file.exists():
-            with open(self.index_file, "r", encoding="utf-8") as f:
-                self.index = json.load(f)
-        else:
-            self.index = {"documents": {}}
-
-    def _save_index(self):
-        """Save the document index"""
-        with open(self.index_file, "w", encoding="utf-8") as f:
-            json.dump(self.index, f, ensure_ascii=False, indent=2)
+        Path(storage_dir).mkdir(parents=True, exist_ok=True)
+        if not DocumentStore._db_initialized:
+            _init_db()
+            DocumentStore._db_initialized = True
 
     def store_document(
         self,
@@ -41,44 +70,132 @@ class DocumentStore:
         chunks: list[dict],
         metadata: dict,
     ) -> str:
-        """Store document metadata and chunks"""
-        doc_info = {
-            "document_id": document_id,
-            "file_name": file_name,
-            "created_at": datetime.now().isoformat(),
-            "chunks_count": len(chunks),
-            "chunks": chunks,
-            "metadata": metadata,
-        }
+        """Store document metadata and its chunks."""
+        conn = _get_connection()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO documents (document_id, file_name, created_at, metadata) VALUES (?, ?, ?, ?)",
+                (document_id, file_name, datetime.now().isoformat(), json.dumps(metadata, ensure_ascii=False)),
+            )
 
-        self.index["documents"][document_id] = doc_info
-        self._save_index()
+            conn.execute(
+                "DELETE FROM chunks WHERE document_id = ?",
+                (document_id,),
+            )
 
-        logger.info("document_stored", document_id=document_id, chunks=len(chunks))
-        return document_id
+            for idx, chunk in enumerate(chunks):
+                conn.execute(
+                    "INSERT INTO chunks (chunk_id, document_id, text, metadata, chunk_index) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        chunk.get("chunk_id", str(uuid.uuid4())),
+                        document_id,
+                        chunk.get("text", ""),
+                        json.dumps(chunk.get("metadata", {}), ensure_ascii=False),
+                        chunk.get("index", idx),
+                    ),
+                )
+
+            conn.commit()
+            logger.info("document_stored", document_id=document_id, chunks=len(chunks))
+            return document_id
+        finally:
+            conn.close()
 
     def get_document(self, document_id: str) -> Optional[dict]:
-        """Get document info by ID"""
-        return self.index["documents"].get(document_id)
+        """Get document info (without chunks)."""
+        conn = _get_connection()
+        try:
+            row = conn.execute(
+                "SELECT document_id, file_name, created_at, metadata FROM documents WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()
+            if not row:
+                return None
+
+            chunks_count = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()[0]
+
+            return {
+                "document_id": row["document_id"],
+                "file_name": row["file_name"],
+                "created_at": row["created_at"],
+                "metadata": json.loads(row["metadata"]),
+                "chunks_count": chunks_count,
+            }
+        finally:
+            conn.close()
+
+    def get_chunks(self, document_id: str, skip: int = 0, limit: int = 100) -> tuple[list[dict], int]:
+        """Get chunks for a document. Returns (chunks, total_count)."""
+        conn = _get_connection()
+        try:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                (document_id,),
+            ).fetchone()[0]
+
+            rows = conn.execute(
+                "SELECT chunk_id, text, metadata, chunk_index FROM chunks WHERE document_id = ? ORDER BY chunk_index LIMIT ? OFFSET ?",
+                (document_id, limit, skip),
+            ).fetchall()
+
+            chunks = []
+            for row in rows:
+                chunks.append({
+                    "chunk_id": row["chunk_id"],
+                    "text": row["text"],
+                    "metadata": json.loads(row["metadata"]),
+                    "index": row["chunk_index"],
+                })
+            return chunks, total
+        finally:
+            conn.close()
 
     def list_documents(self, skip: int = 0, limit: int = 100) -> list[dict]:
-        """List all documents with pagination"""
-        docs = list(self.index["documents"].values())
-        docs.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        """List all documents."""
+        conn = _get_connection()
+        try:
+            rows = conn.execute(
+                """SELECT d.document_id, d.file_name, d.created_at, d.metadata,
+                          COUNT(c.chunk_id) AS chunks_count
+                   FROM documents d
+                   LEFT JOIN chunks c ON d.document_id = c.document_id
+                   GROUP BY d.document_id
+                   ORDER BY d.created_at DESC
+                   LIMIT ? OFFSET ?""",
+                (limit, skip),
+            ).fetchall()
 
-        for doc in docs:
-            doc.pop("chunks", None)
-
-        return docs[skip : skip + limit]
+            return [
+                {
+                    "document_id": row["document_id"],
+                    "file_name": row["file_name"],
+                    "created_at": row["created_at"],
+                    "metadata": json.loads(row["metadata"]),
+                    "chunks_count": row["chunks_count"],
+                }
+                for row in rows
+            ]
+        finally:
+            conn.close()
 
     def delete_document(self, document_id: str) -> bool:
-        """Delete a document"""
-        if document_id in self.index["documents"]:
-            del self.index["documents"][document_id]
-            self._save_index()
-            logger.info("document_deleted", document_id=document_id)
-            return True
-        return False
+        """Delete a document and its chunks."""
+        conn = _get_connection()
+        try:
+            cur = conn.execute(
+                "DELETE FROM documents WHERE document_id = ?",
+                (document_id,),
+            )
+            conn.commit()
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info("document_deleted", document_id=document_id)
+            return deleted
+        finally:
+            conn.close()
 
     def update_chunk(
         self,
@@ -86,27 +203,41 @@ class DocumentStore:
         chunk_id: str,
         updates: dict,
     ) -> bool:
-        """Update a chunk's metadata or text"""
-        doc = self.get_document(document_id)
-        if not doc:
-            return False
-
-        for chunk in doc.get("chunks", []):
-            if chunk.get("chunk_id") == chunk_id:
-                chunk.update(updates)
-                self.index["documents"][document_id] = doc
-                self._save_index()
-                return True
-
-        return False
+        """Update a chunk's text or metadata."""
+        conn = _get_connection()
+        try:
+            sets = []
+            params = []
+            if "text" in updates:
+                sets.append("text = ?")
+                params.append(updates["text"])
+            if "metadata" in updates:
+                sets.append("metadata = ?")
+                params.append(json.dumps(updates["metadata"], ensure_ascii=False))
+            if not sets:
+                return False
+            params.extend([chunk_id, document_id])
+            cur = conn.execute(
+                f"UPDATE chunks SET {', '.join(sets)} WHERE chunk_id = ? AND document_id = ?",
+                params,
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
 
     def get_statistics(self) -> dict:
-        """Get overall statistics"""
-        docs = self.index["documents"]
-        total_chunks = sum(doc.get("chunks_count", 0) for doc in docs.values())
-
-        return {
-            "total_documents": len(docs),
-            "total_chunks": total_chunks,
-            "documents": list(docs.keys()),
-        }
+        """Get overall statistics."""
+        conn = _get_connection()
+        try:
+            row = conn.execute(
+                """SELECT COUNT(*) AS total_documents,
+                          (SELECT COUNT(*) FROM chunks) AS total_chunks
+                   FROM documents"""
+            ).fetchone()
+            return {
+                "total_documents": row["total_documents"],
+                "total_chunks": row["total_chunks"],
+            }
+        finally:
+            conn.close()

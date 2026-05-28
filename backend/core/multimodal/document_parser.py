@@ -77,47 +77,7 @@ class DocumentParser:
         doc.metadata["file_name"] = file_name
         doc.metadata["source"] = "pdf"
 
-        try:
-            import pdfplumber
-
-            with pdfplumber.open(file_path) as pdf:
-                doc.metadata["page_count"] = len(pdf.pages)
-
-                for page_num, page in enumerate(pdf.pages, 1):
-                    page_text = page.extract_text() or ""
-
-                    blocks = self._split_into_blocks(page_text)
-                    for block in blocks:
-                        doc.text_blocks.append({
-                            "text": block,
-                            "page": page_num,
-                            "type": "text",
-                        })
-
-                    doc.content += page_text + "\n\n"
-
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if table:
-                            doc.tables.append({
-                                "data": table,
-                                "page": page_num,
-                            })
-
-        except ImportError:
-            self.logger.warning("pdfplumber not available, using fallback")
-            return await self._parse_pdf_fallback(file_path, file_name)
-        except Exception as e:
-            self.logger.error("pdf_parsing_failed", error=str(e))
-            return await self._parse_pdf_fallback(file_path, file_name)
-
-        doc.title = self._extract_title(doc.content) or file_name
-        return doc
-
-    async def _parse_pdf_fallback(self, file_path: str, file_name: str) -> ParsedDocument:
-        """Fallback PDF parsing using PyMuPDF"""
-        doc = ParsedDocument()
-        doc.metadata["file_name"] = file_name
+        parsed_ok = False
 
         try:
             import fitz
@@ -127,21 +87,68 @@ class DocumentParser:
 
             for page_num in range(len(pdf_doc)):
                 page = pdf_doc[page_num]
-                text = page.get_text()
+                text = page.get_text("text") or ""
+                if not text.strip() and page_num == 0:
+                    text = page.get_text("blocks") or ""
                 doc.content += text + "\n\n"
 
-                doc.text_blocks.append({
-                    "text": text,
-                    "page": page_num + 1,
-                    "type": "text",
-                })
+                blocks = self._split_into_blocks(text)
+                for block in blocks:
+                    doc.text_blocks.append({
+                        "text": block,
+                        "page": page_num + 1,
+                        "type": "text",
+                    })
+
+            if doc.content.strip():
+                parsed_ok = True
 
         except ImportError:
-            self.logger.error("Neither pdfplumber nor PyMuPDF available")
+            self.logger.warning("PyMuPDF not available")
         except Exception as e:
-            self.logger.error("fallback_pdf_parsing_failed", error=str(e))
+            self.logger.error("pymupdf_parsing_failed", error=str(e))
 
-        doc.title = file_name
+        if not parsed_ok:
+            try:
+                import pdfplumber
+
+                with pdfplumber.open(file_path) as pdf:
+                    doc.metadata["page_count"] = len(pdf.pages)
+
+                    for page_num, page in enumerate(pdf.pages, 1):
+                        page_text = page.extract_text() or ""
+
+                        blocks = self._split_into_blocks(page_text)
+                        for block in blocks:
+                            doc.text_blocks.append({
+                                "text": block,
+                                "page": page_num,
+                                "type": "text",
+                            })
+
+                        doc.content += page_text + "\n\n"
+
+                        tables = page.extract_tables()
+                        for table in tables:
+                            if table:
+                                doc.tables.append({
+                                    "data": table,
+                                    "page": page_num,
+                                })
+
+                if doc.content.strip():
+                    parsed_ok = True
+
+            except ImportError:
+                self.logger.warning("pdfplumber not available")
+            except Exception as e:
+                self.logger.error("pdfplumber_parsing_failed", error=str(e))
+
+        if not parsed_ok:
+            self.logger.warning("pdf_no_text_content", file_name=file_name)
+            doc.content = "[此PDF文档无可提取的文本内容，可能是扫描件或图片型PDF]"
+
+        doc.title = self._extract_title(doc.content) or file_name
         return doc
 
     async def _parse_docx(self, file_path: str, file_name: str) -> ParsedDocument:

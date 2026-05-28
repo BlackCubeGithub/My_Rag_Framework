@@ -35,8 +35,24 @@
 | LLM | DeepSeek / GPT-4 |
 | Embedding | BGE-large-zh |
 | 向量数据库 | Chroma / Qdrant |
+| 关系数据存储 | SQLite |
 | 前端 | Vue 3 + Element Plus + ECharts |
 | 可观测性 | OpenTelemetry |
+
+## 数据存储
+
+系统所有持久化数据统一存储，架构如下：
+
+| 数据类型 | 存储位置 | 技术 |
+|----------|----------|------|
+| 文档元数据 | `data/documents/store.db` | SQLite |
+| 文档分块内容 | `data/documents/store.db` (chunks 表) | SQLite |
+| RAG 执行 Trace | `data/traces/store.db` | SQLite |
+| 向量嵌入 | `data/vector_store/` | ChromaDB |
+| BM25 索引 | 内存（随进程自动重建） | rank_bm25 |
+| 原始上传文件 | `data/uploads/`（处理后自动清理） | 文件系统 |
+
+> SQLite 数据库在首次启动时自动创建，无需手动初始化。
 
 ## 项目结构
 
@@ -63,12 +79,21 @@ My_RAG_Framework/
 │   │   │   ├── document_parser.py
 │   │   │   ├── image_processor.py
 │   │   │   └── table_extractor.py
+│   │   ├── storage/        # 存储模块
+│   │   │   ├── document_store.py  # SQLite 文档/分块存储
+│   │   │   └── vector_store.py   # Chroma 向量存储
 │   │   └── generation/     # 生成模块
-│   ├── observability/      # 可观测性
-│   │   ├── rag_trace.py
-│   │   ├── evaluator.py
-│   │   └── debug_panel.py
-│   └── core/storage/       # 存储模块
+│   └── observability/      # 可观测性
+│       ├── rag_trace.py    # SQLite Trace 存储
+│       ├── tracer.py       # OpenTelemetry 配置
+│       ├── evaluator.py
+│       └── debug_panel.py
+│
+├── data/                   # 数据存储
+│   ├── documents/          # 文档 SQLite DB
+│   ├── traces/             # Trace SQLite DB
+│   ├── vector_store/       # Chroma 向量数据库
+│   └── uploads/            # 临时上传文件
 │
 ├── frontend/               # Vue 3 前端
 │   └── src/
@@ -82,7 +107,8 @@ My_RAG_Framework/
 │
 ├── scripts/
 │   ├── download_models.py  # 模型下载脚本
-│   └── setup_env.py        # 环境安装脚本
+│   ├── migrate_to_sqlite.py          # 迁移文档数据到 SQLite
+│   └── migrate_traces_to_sqlite.py   # 迁移 Trace 数据到 SQLite
 │
 └── configs/               # 配置文件
 ```
@@ -209,6 +235,12 @@ Content-Type: multipart/form-data
 file: <file>
 chunk_size: 512
 chunk_overlap: 128
+```
+
+### 查看分块
+
+```bash
+GET /api/v1/ingest/documents/{document_id}/chunks
 ```
 
 ### 可观测性

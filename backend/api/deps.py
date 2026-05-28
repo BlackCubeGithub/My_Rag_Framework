@@ -151,3 +151,15 @@ def get_query_rewriter() -> QueryRewriter:
     if _query_rewriter is None:
         raise HTTPException(status_code=503, detail="Query rewriter not initialized")
     return _query_rewriter
+
+
+def get_vector_retriever() -> VectorRetriever:
+    if _vector_retriever is None:
+        raise HTTPException(status_code=503, detail="Vector retriever not initialized")
+    return _vector_retriever
+
+
+def get_bm25_retriever() -> BM25Retriever:
+    if _bm25_retriever is None:
+        raise HTTPException(status_code=503, detail="BM25 retriever not initialized")
+    return _bm25_retriever
