@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+.venv/
+
+# Data
+data/
+*.db
+*.sqlite
+
+# Models (downloaded from HuggingFace)
+models/
+.huggingface/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Node
+node_modules/
+dist/
+.DS_Store
+
+# Misc
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
