@@ -14,15 +14,33 @@ logger = structlog.get_logger()
 
 
 class TraceResponse(BaseModel):
-    """Trace response"""
+    """Full trace response with all chain data"""
     trace_id: str
     query: str
     query_type: str
     timestamp: str
-    state_history: list[dict]
-    retrieval_rounds: list[dict]
-    generation: dict
-    verification: dict
+
+    query_analysis: dict = {}
+    planning: dict = {}
+    rewritten_queries: list = []
+    state_history: list = []
+
+    retrieval_rounds: list = []
+    all_chunks: list = []
+    total_chunks_retrieved: int = 0
+
+    reflection_rounds_detail: list = []
+    reflection_rounds: int = 0
+
+    generation: Optional[dict] = None
+    verification: Optional[dict] = None
+
+    answer: str = ""
+    sources_count: int = 0
+
+    stage_latencies: dict = {}
+    total_latency_ms: float = 0.0
+    error: Optional[str] = None
 
 
 @router.get("/observability/traces/{trace_id}")

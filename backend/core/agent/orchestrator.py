@@ -59,16 +59,21 @@ class AgentContext:
 
     query_analysis: Optional[Any] = None
     retrieval_plan: Optional[RetrievalPlan] = None
+    rewritten_queries: list[str] = field(default_factory=list)
     all_chunks: list[dict] = field(default_factory=list)
     reflection_results: list[ReflectionResult] = field(default_factory=list)
     generation: Optional[str] = None
+    generation_detail: Optional[dict] = None
     verification: Optional[VerificationResult] = None
 
     reflection_rounds: int = 0
     retrieval_rounds: int = 0
+    retrieval_rounds_detail: list[dict] = field(default_factory=list)
 
     start_time: float = field(default_factory=time.time)
     end_time: Optional[float] = None
+
+    stage_latencies: dict = field(default_factory=dict)
 
     error: Optional[str] = None
 
@@ -152,34 +157,40 @@ class AgenticRAGOrchestrator:
 
         try:
             self._transition_state(ctx, AgentState.ANALYZING)
-
+            t0 = time.time()
             analysis = await self.query_analyzer.analyze(query)
             ctx.query_analysis = analysis
+            ctx.stage_latencies["analyzing_ms"] = (time.time() - t0) * 1000
 
             self._transition_state(ctx, AgentState.PLANNING)
-
+            t0 = time.time()
             plan = await self.planner.create_plan(
                 query=query,
                 query_type=analysis.query_type.value,
             )
             ctx.retrieval_plan = plan
+            ctx.stage_latencies["planning_ms"] = (time.time() - t0) * 1000
 
             self._transition_state(ctx, AgentState.RETRIEVING)
-
+            t0 = time.time()
             chunks = await self._execute_retrieval(ctx, query, top_k)
             ctx.all_chunks = chunks
             ctx.retrieval_rounds = 1
+            ctx.stage_latencies["retrieval_ms"] = (time.time() - t0) * 1000
 
             if enable_reflection:
+                t0 = time.time()
                 await self._run_reflection_loop(ctx, top_k)
+                ctx.stage_latencies["reflecting_ms"] = (time.time() - t0) * 1000
 
             self._transition_state(ctx, AgentState.GENERATING)
-
+            t0 = time.time()
             answer = await self._generate_answer(ctx)
+            ctx.stage_latencies["generating_ms"] = (time.time() - t0) * 1000
 
             if enable_verification:
                 self._transition_state(ctx, AgentState.VERIFYING)
-
+                t0 = time.time()
                 verification = await self.verifier.verify(
                     query=query,
                     answer=answer,
@@ -187,10 +198,15 @@ class AgenticRAGOrchestrator:
                     threshold=self.verification_threshold,
                 )
                 ctx.verification = verification
+                ctx.stage_latencies["verifying_ms"] = (time.time() - t0) * 1000
 
                 if verification.decision == VerificationDecision.REGENERATE:
                     logger.info("verification_failed_regenerating")
+                    t0 = time.time()
                     answer = await self._generate_answer(ctx, force_regenerate=True)
+                    ctx.stage_latencies["generating_ms"] = (
+                        ctx.stage_latencies.get("generating_ms", 0) + (time.time() - t0) * 1000
+                    )
 
             ctx.generation = answer
 
@@ -238,22 +254,58 @@ class AgenticRAGOrchestrator:
         top_k: int,
     ) -> list[dict]:
         """Single query retrieval with reranking"""
+        import time
+
+        t0 = time.time()
         rewritten_queries = await self.query_rewriter.rewrite_for_retrieval(query, top_k_expansions=2)
+        rewrite_latency = (time.time() - t0) * 1000
+        ctx.rewritten_queries = rewritten_queries
 
         all_chunks = []
         seen_ids = set()
+        round_detail = {
+            "round_id": 0,
+            "sub_query": query,
+            "rewritten_queries": rewritten_queries,
+            "fusion_method": "hybrid_rrf",
+            "alpha": self.hybrid_retriever.alpha,
+            "rewrite_latency_ms": rewrite_latency,
+            "chunks_before_rerank": 0,
+            "vector_count": 0,
+            "bm25_count": 0,
+            "vector_scores": [],
+            "bm25_scores": [],
+            "reranked_chunks": [],
+            "latency_ms": 0.0,
+        }
 
         for q in rewritten_queries:
             chunks = await self.hybrid_retriever.search(q, top_k=top_k)
+            round_detail["chunks_before_rerank"] += len(chunks)
+            round_detail["vector_count"] += sum(1 for c in chunks if c.get("vector_score", 0) > 0)
+            round_detail["bm25_count"] += sum(1 for c in chunks if c.get("bm25_score", 0) > 0)
+            round_detail["vector_scores"].extend([float(c.get("vector_score", 0)) for c in chunks])
+            round_detail["bm25_scores"].extend([float(c.get("bm25_score", 0)) for c in chunks])
             for chunk in chunks:
                 if chunk.get("chunk_id") not in seen_ids:
                     all_chunks.append(chunk)
                     seen_ids.add(chunk.get("chunk_id"))
 
         if all_chunks:
+            round_detail["latency_ms"] = (time.time() - t0) * 1000
             reranked = await self.reranker.rerank(query, all_chunks, top_k=top_k)
+            round_detail["reranked_chunks"] = [
+                {
+                    "chunk_id": c.get("chunk_id", ""),
+                    "rerank_score": float(c.get("rerank_score", 0)),
+                    "rank": i + 1,
+                }
+                for i, c in enumerate(reranked[:top_k])
+            ]
+            ctx.retrieval_rounds_detail.append(round_detail)
             return reranked
 
+        ctx.retrieval_rounds_detail.append(round_detail)
         return all_chunks[:top_k]
 
     async def _multi_hop_retrieval(
@@ -263,16 +315,43 @@ class AgenticRAGOrchestrator:
         top_k: int,
     ) -> list[dict]:
         """Multi-hop retrieval for complex queries"""
+        import time
+
         plan = ctx.retrieval_plan
         all_chunks = []
+        seen_ids = set()
+        round_id = 0
 
         for step in plan.steps:
             sub_query = step.sub_query
+            t0 = time.time()
+
             chunks = await self.hybrid_retriever.search(sub_query, top_k=top_k)
             reranked = await self.reranker.rerank(sub_query, chunks, top_k=5)
-            all_chunks.extend(reranked)
 
+            round_detail = {
+                "round_id": round_id,
+                "sub_query": sub_query,
+                "planning_step_id": step.step_id,
+                "fusion_method": "hybrid_rrf",
+                "alpha": self.hybrid_retriever.alpha,
+                "chunks_before_rerank": len(chunks),
+                "chunks_after_rerank": len(reranked),
+                "vector_count": sum(1 for c in chunks if c.get("vector_score", 0) > 0),
+                "bm25_count": sum(1 for c in chunks if c.get("bm25_score", 0) > 0),
+                "vector_scores": [float(c.get("vector_score", 0)) for c in chunks],
+                "bm25_scores": [float(c.get("bm25_score", 0)) for c in chunks],
+                "reranked_chunks": [
+                    {"chunk_id": c.get("chunk_id", ""), "rerank_score": float(c.get("rerank_score", 0)), "rank": i + 1}
+                    for i, c in enumerate(reranked)
+                ],
+                "latency_ms": (time.time() - t0) * 1000,
+            }
+            ctx.retrieval_rounds_detail.append(round_detail)
+
+            all_chunks.extend(reranked)
             ctx.retrieval_rounds += 1
+            round_id += 1
 
         seen_ids = set()
         unique_chunks = []
@@ -301,6 +380,16 @@ class AgenticRAGOrchestrator:
 
             ctx.reflection_results.append(reflection)
 
+            round_detail = {
+                "round_id": ctx.reflection_rounds,
+                "decision": reflection.decision.value,
+                "confidence_score": reflection.confidence_score,
+                "missing_aspects": list(reflection.missing_aspects),
+                "supplementary_queries": list(reflection.supplementary_queries),
+                "reasoning": reflection.reasoning,
+                "additional_chunks_count": 0,
+            }
+
             if reflection.decision == ReflectionDecision.PROCEED:
                 if reflection.confidence_score >= self.reflection_threshold:
                     logger.info(
@@ -320,6 +409,7 @@ class AgenticRAGOrchestrator:
                 if supplementary_chunks:
                     ctx.all_chunks.extend(supplementary_chunks)
                     ctx.retrieval_rounds += 1
+                    round_detail["additional_chunks_count"] = len(supplementary_chunks)
 
                     seen_ids = set()
                     unique_chunks = []
@@ -336,6 +426,7 @@ class AgenticRAGOrchestrator:
                 ctx.reflection_rounds += 1
                 chunks = await self.hybrid_retriever.search(ctx.query, top_k=top_k * 2)
                 ctx.all_chunks.extend(chunks)
+                round_detail["additional_chunks_count"] = len(chunks)
 
             else:
                 break
@@ -361,10 +452,37 @@ class AgenticRAGOrchestrator:
             include_citations=True,
         )
 
-        answer = await self.generator.generate(prompt, system_prompt=None)
+        import time
+        start_time = time.time()
+        raw_response = await self.generator.generate(prompt, system_prompt=None)
+        gen_latency_ms = (time.time() - start_time) * 1000
+
+        try:
+            token_count = getattr(self.generator, "_last_usage", None)
+            if token_count and hasattr(token_count, "total_tokens"):
+                pt = token_count.prompt_tokens
+                ct = token_count.completion_tokens
+                tt = token_count.total_tokens
+            else:
+                pt = ct = tt = 0
+        except Exception:
+            pt = ct = tt = 0
+
+        answer = raw_response
 
         if ctx.all_chunks:
             answer = self.citation_engine.add_inline_citations(answer, ctx.all_chunks)
+
+        ctx.generation_detail = {
+            "prompt": prompt,
+            "raw_response": raw_response,
+            "final_answer": answer,
+            "model": self.generator.model,
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "total_tokens": tt,
+            "latency_ms": gen_latency_ms,
+        }
 
         return answer
 

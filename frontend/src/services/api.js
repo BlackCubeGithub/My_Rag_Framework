@@ -14,7 +14,9 @@ api.interceptors.response.use(
 )
 
 export const ragApi = {
-  query: (data) => api.post('/rag/query', data),
+  query: (data) => api.post('/rag/query', data, {
+    timeout: 600000,  // 10 min — RAG chain involves multiple LLM calls
+  }),
   health: () => api.get('/rag/health'),
 }
 

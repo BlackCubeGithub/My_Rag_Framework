@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     LLM_BASE_URL: str = "https://api.openai.com/v1"
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 4096
+    LLM_TIMEOUT: float = 120.0  # seconds — increase for slow models
 
     # Embedding Configuration
     EMBEDDING_MODEL: str = "BAAI/bge-large-zh-v1.5"

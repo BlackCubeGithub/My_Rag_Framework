@@ -58,6 +58,7 @@ async def init_services():
         base_url=settings.LLM_BASE_URL,
         temperature=settings.LLM_TEMPERATURE,
         max_tokens=settings.LLM_MAX_TOKENS,
+        timeout=settings.LLM_TIMEOUT,
     )
 
     _vector_retriever = VectorRetriever(vector_store=_vector_store)

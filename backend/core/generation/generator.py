@@ -15,6 +15,8 @@ logger = structlog.get_logger()
 class Generator:
     """LLM text generator using OpenAI-compatible API"""
 
+    DEFAULT_TIMEOUT_SEC = 120.0
+
     def __init__(
         self,
         model: str = "gpt-4-turbo",
@@ -22,14 +24,17 @@ class Generator:
         base_url: str = "https://api.openai.com/v1",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        timeout: float = DEFAULT_TIMEOUT_SEC,
     ):
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.timeout = timeout
 
         self.client = AsyncOpenAI(
             api_key=api_key or settings.LLM_API_KEY or "dummy",
             base_url=base_url or settings.LLM_BASE_URL,
+            timeout=timeout,
         )
 
     async def generate(
@@ -61,11 +66,14 @@ class Generator:
 
             latency = (time.time() - start_time) * 1000
 
+            usage = response.usage
+            self._last_usage = usage
+
             logger.info(
                 "generation_completed",
                 model=self.model,
                 latency_ms=latency,
-                tokens=response.usage.total_tokens if response.usage else 0,
+                tokens=usage.total_tokens if usage else 0,
             )
 
             return response.choices[0].message.content or ""

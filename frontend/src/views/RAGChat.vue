@@ -211,10 +211,17 @@ async function sendMessage() {
     })
 
   } catch (error) {
-    ElMessage.error('查询失败: ' + (error.message || '未知错误'))
+    const isTimeout = error.code === 'ECONNABORTED' || error.message?.includes('timeout')
+    ElMessage.error(
+      isTimeout
+        ? '请求超时（LLM响应时间过长），请稍后重试或减少反思/验证轮次'
+        : '查询失败: ' + (error.message || '未知错误')
+    )
     messages.value.push({
       role: 'assistant',
-      content: '抱歉，发生了错误。请稍后重试。',
+      content: isTimeout
+        ? '抱歉，LLM 响应超时了（>10分钟）。你可以尝试关闭「反思」和「验证」选项，或减少 Top-K 值后重试。'
+        : '抱歉，发生了错误。请稍后重试。',
       sources: [],
       metadata: null,
     })

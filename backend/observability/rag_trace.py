@@ -1,6 +1,6 @@
 """
 RAG Tracer
-Comprehensive tracing for RAG pipeline
+Comprehensive tracing for RAG pipeline — full chain metadata
 """
 import json
 import time
@@ -20,6 +20,107 @@ logger = structlog.get_logger()
 
 _DB_PATH = "./data/traces/store.db"
 
+# ── Per-stage detail dataclasses ────────────────────────────────────────────────
+
+
+@dataclass
+class QueryAnalysisDetail:
+    """Full query analysis output"""
+    query_type: str
+    entities: list[str]
+    key_concepts: list[str]
+    requires_reasoning: bool
+    suggested_approach: str
+    reasoning: str = ""
+
+
+@dataclass
+class PlanningDetail:
+    """Full planning output"""
+    plan_type: str
+    steps: list[dict]
+    final_strategy: str
+    reasoning: str
+
+
+@dataclass
+class RetrievalChunkDetail:
+    """Single chunk with all scores"""
+    chunk_id: str
+    text: str
+    source: str
+    fused_score: float = 0.0
+    vector_score: float = 0.0
+    bm25_score: float = 0.0
+    rerank_score: float = 0.0
+    rank: int = 0
+    retrieval_method: str = ""
+
+
+@dataclass
+class RetrievalRoundDetail:
+    """Detailed info for one retrieval round"""
+    round_id: int
+    sub_query: str
+    fusion_method: str
+    alpha: float = 0.5
+    vector_count: int = 0
+    bm25_count: int = 0
+    vector_scores: list[float] = field(default_factory=list)
+    bm25_scores: list[float] = field(default_factory=list)
+    reranked_chunks: list[dict] = field(default_factory=list)
+    latency_ms: float = 0.0
+
+
+@dataclass
+class ReflectionRoundDetail:
+    """Detailed info for one reflection round"""
+    round_id: int
+    decision: str
+    confidence_score: float
+    missing_aspects: list[str]
+    supplementary_queries: list[str]
+    reasoning: str
+    additional_chunks_count: int = 0
+
+
+@dataclass
+class GenerationDetail:
+    """Full generation metadata"""
+    prompt: str = ""
+    raw_response: str = ""
+    final_answer: str = ""
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    latency_ms: float = 0.0
+
+
+@dataclass
+class VerificationDetail:
+    """Full verification metadata"""
+    decision: str
+    faithfulness_score: float
+    has_hallucination: bool
+    citation_accuracy: float
+    issues: list[str]
+    revised_answer: Optional[str] = None
+
+
+@dataclass
+class StageLatencies:
+    """Per-stage latency breakdown"""
+    analyzing_ms: float = 0.0
+    planning_ms: float = 0.0
+    retrieval_ms: float = 0.0
+    reflecting_ms: float = 0.0
+    generating_ms: float = 0.0
+    verifying_ms: float = 0.0
+
+
+# ── Database schema ────────────────────────────────────────────────────────────
+
 
 def _get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
@@ -32,31 +133,56 @@ def _init_db():
     Path("./data/traces").mkdir(parents=True, exist_ok=True)
     conn = _get_connection()
     try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS traces (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                trace_id TEXT UNIQUE NOT NULL,
-                query TEXT NOT NULL DEFAULT '',
-                query_type TEXT NOT NULL DEFAULT 'simple',
-                timestamp TEXT NOT NULL,
-                state_history TEXT NOT NULL DEFAULT '[]',
-                planning_steps TEXT NOT NULL DEFAULT '[]',
-                reflection_rounds INTEGER NOT NULL DEFAULT 0,
-                retrieval_rounds TEXT NOT NULL DEFAULT '[]',
-                total_chunks_retrieved INTEGER NOT NULL DEFAULT 0,
-                generation TEXT,
-                verification TEXT,
-                answer TEXT NOT NULL DEFAULT '',
-                sources_count INTEGER NOT NULL DEFAULT 0,
-                total_latency_ms REAL NOT NULL DEFAULT 0,
-                error TEXT
-            );
+        existing = conn.execute(
+            "PRAGMA table_info(traces)"
+        ).fetchall()
+        existing_cols = {row[1] for row in existing}
 
-            CREATE INDEX IF NOT EXISTS idx_traces_timestamp
-                ON traces(timestamp DESC);
-            CREATE INDEX IF NOT EXISTS idx_traces_query_type
-                ON traces(query_type);
-        """)
+        if not existing_cols:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS traces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT UNIQUE NOT NULL,
+                    query TEXT NOT NULL DEFAULT '',
+                    query_type TEXT NOT NULL DEFAULT 'simple',
+                    timestamp TEXT NOT NULL,
+                    query_analysis TEXT NOT NULL DEFAULT '{}',
+                    planning TEXT NOT NULL DEFAULT '{}',
+                    rewritten_queries TEXT NOT NULL DEFAULT '[]',
+                    state_history TEXT NOT NULL DEFAULT '[]',
+                    retrieval_rounds TEXT NOT NULL DEFAULT '[]',
+                    all_chunks TEXT NOT NULL DEFAULT '[]',
+                    total_chunks_retrieved INTEGER NOT NULL DEFAULT 0,
+                    reflection_rounds_detail TEXT NOT NULL DEFAULT '[]',
+                    reflection_rounds INTEGER NOT NULL DEFAULT 0,
+                    generation TEXT,
+                    verification TEXT,
+                    answer TEXT NOT NULL DEFAULT '',
+                    sources_count INTEGER NOT NULL DEFAULT 0,
+                    stage_latencies TEXT NOT NULL DEFAULT '{}',
+                    total_latency_ms REAL NOT NULL DEFAULT 0,
+                    error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON traces(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_traces_query_type ON traces(query_type);
+            """)
+        else:
+            all_cols = {
+                "query_analysis": "{}",
+                "planning": "{}",
+                "rewritten_queries": "[]",
+                "state_history": "[]",
+                "all_chunks": "[]",
+                "reflection_rounds_detail": "[]",
+                "stage_latencies": "{}",
+            }
+            for col, default in all_cols.items():
+                if col not in existing_cols:
+                    try:
+                        conn.execute(f"ALTER TABLE traces ADD COLUMN {col} TEXT NOT NULL DEFAULT '{default}'")
+                    except Exception:
+                        pass
+
         conn.commit()
     finally:
         conn.close()
@@ -76,52 +202,44 @@ class StateTransition:
 
 
 @dataclass
-class RetrievalRound:
-    round_id: int
-    sub_query: str
-    retrieval_method: str
-    top_k: int
-    retrieved_chunks: list[dict]
-    scores: dict
-    latency_ms: float
-
-
-@dataclass
-class GenerationMetadata:
-    prompt: str
-    response: str
-    token_count: int
-    latency_ms: float
-    model: str
-
-
-@dataclass
-class VerificationMetadata:
-    faithfulness_score: float
-    has_hallucination: bool
-    citation_accuracy: float
-    decision: str
-
-
-@dataclass
 class RAGTrace:
     trace_id: str
     query: str
     query_type: str
     timestamp: str
 
-    state_history: list[dict]
-    planning_steps: list[dict]
-    reflection_rounds: int
+    # query analysis
+    query_analysis: dict
 
+    # planning
+    planning: dict
+
+    # rewritten queries
+    rewritten_queries: list[str]
+
+    # state transitions
+    state_history: list[dict]
+
+    # retrieval
     retrieval_rounds: list[dict]
+    all_chunks: list[dict]
     total_chunks_retrieved: int
 
+    # reflection
+    reflection_rounds_detail: list[dict]
+    reflection_rounds: int
+
+    # generation
     generation: Optional[dict]
+
+    # verification
     verification: Optional[dict]
 
     answer: str
     sources_count: int
+
+    # per-stage latency
+    stage_latencies: dict
 
     total_latency_ms: float
     error: Optional[str] = None
@@ -183,15 +301,20 @@ class RAGTracer:
             query=query,
             query_type="unknown",
             timestamp=datetime.now().isoformat(),
+            query_analysis={},
+            planning={},
+            rewritten_queries=[],
             state_history=[],
-            planning_steps=[],
-            reflection_rounds=0,
             retrieval_rounds=[],
+            all_chunks=[],
             total_chunks_retrieved=0,
+            reflection_rounds_detail=[],
+            reflection_rounds=0,
             generation=None,
             verification=None,
             answer="",
             sources_count=0,
+            stage_latencies={},
             total_latency_ms=0,
         )
         self._traces[trace_id] = trace
@@ -206,14 +329,17 @@ class RAGTracer:
             return
 
         trace = self._traces[trace_id]
-        trace.query_type = getattr(ctx, "query_analysis", None)
-        if trace.query_type and hasattr(trace.query_type, "query_type"):
-            trace.query_type = trace.query_type.query_type.value
-        elif isinstance(trace.query_type, dict):
-            trace.query_type = trace.query_type.get("query_type", "unknown")
-        else:
-            trace.query_type = "simple"
 
+        # query type
+        trace.query_type = self._extract_query_type(ctx)
+
+        # query analysis
+        trace.query_analysis = self._extract_query_analysis(ctx)
+
+        # planning
+        trace.planning = self._extract_planning(ctx)
+
+        # state transitions
         trace.state_history = [
             {
                 "from": t.from_state.value if hasattr(t.from_state, "value") else str(t.from_state),
@@ -223,27 +349,36 @@ class RAGTracer:
             for t in ctx.state_history
         ]
 
-        trace.planning_steps = [
-            {"step_id": s.step_id, "action": s.action, "sub_query": s.sub_query}
-            for s in (getattr(ctx, "retrieval_plan", None) or RetrievalPlan(
-                plan_type="direct", steps=[], final_strategy="", reasoning=""
-            )).steps
-            if hasattr(s, "step_id")
-        ]
+        # rewritten queries
+        trace.rewritten_queries = getattr(ctx, "rewritten_queries", [])
 
-        trace.reflection_rounds = ctx.reflection_rounds
+        # retrieval rounds (now with full detail)
+        trace.retrieval_rounds = self._extract_retrieval_rounds(ctx)
+
+        # all chunks with scores
+        trace.all_chunks = self._extract_chunks(ctx)
         trace.total_chunks_retrieved = len(ctx.all_chunks)
 
-        trace.retrieval_rounds = [
-            {"round_id": i, "chunks_count": len(ctx.all_chunks)}
-            for i in range(ctx.retrieval_rounds)
-        ]
+        # reflection rounds
+        trace.reflection_rounds = ctx.reflection_rounds
+        trace.reflection_rounds_detail = self._extract_reflection_rounds(ctx)
 
-        if ctx.generation:
+        # generation
+        trace.generation = getattr(ctx, "generation_detail", None)
+        if trace.generation:
+            trace.answer = trace.generation.get("final_answer", ctx.generation or "")
+        elif ctx.generation:
             trace.answer = ctx.generation
 
+        # verification
+        trace.verification = self._extract_verification(ctx)
+
         trace.sources_count = len(ctx.all_chunks)
+
+        # per-stage latencies
+        trace.stage_latencies = self._extract_stage_latencies(ctx)
         trace.total_latency_ms = (ctx.end_time - ctx.start_time) * 1000 if ctx.end_time else 0
+
         trace.error = ctx.error
 
         if not ctx.error:
@@ -260,29 +395,149 @@ class RAGTracer:
         self._save_trace(trace)
         logger.info("trace_recorded", trace_id=trace_id, latency_ms=trace.total_latency_ms)
 
+    # ── extraction helpers ──────────────────────────────────────────────────────
+
+    def _extract_query_type(self, ctx) -> str:
+        qa = getattr(ctx, "query_analysis", None)
+        if qa and hasattr(qa, "query_type"):
+            return qa.query_type.value
+        if isinstance(qa, dict):
+            return qa.get("query_type", "simple")
+        return "simple"
+
+    def _extract_query_analysis(self, ctx) -> dict:
+        qa = getattr(ctx, "query_analysis", None)
+        if qa is None:
+            return {}
+        if hasattr(qa, "query_type"):
+            return {
+                "query_type": qa.query_type.value,
+                "entities": list(qa.entities) if hasattr(qa, "entities") else [],
+                "key_concepts": list(qa.key_concepts) if hasattr(qa, "key_concepts") else [],
+                "requires_reasoning": bool(getattr(qa, "requires_reasoning", False)),
+                "suggested_approach": getattr(qa, "suggested_approach", ""),
+                "reasoning": getattr(qa, "reasoning", ""),
+            }
+        if isinstance(qa, dict):
+            return qa
+        return {}
+
+    def _extract_planning(self, ctx) -> dict:
+        plan = getattr(ctx, "retrieval_plan", None)
+        if plan is None:
+            return {}
+        from backend.core.agent.planner import RetrievalPlan, PlanType
+        plan_type = ""
+        if hasattr(plan, "plan_type"):
+            pt = plan.plan_type
+            plan_type = pt.value if hasattr(pt, "value") else str(pt)
+        return {
+            "plan_type": plan_type,
+            "steps": [
+                {
+                    "step_id": s.step_id,
+                    "action": s.action,
+                    "sub_query": s.sub_query,
+                    "dependencies": list(s.dependencies) if hasattr(s, "dependencies") else [],
+                    "expected_output": getattr(s, "expected_output", ""),
+                }
+                for s in (plan.steps if hasattr(plan, "steps") else [])
+            ],
+            "final_strategy": getattr(plan, "final_strategy", ""),
+            "reasoning": getattr(plan, "reasoning", ""),
+        }
+
+    def _extract_retrieval_rounds(self, ctx) -> list[dict]:
+        raw = getattr(ctx, "retrieval_rounds_detail", None)
+        if raw:
+            return raw
+        return [
+            {"round_id": i, "chunks_count": len(ctx.all_chunks)}
+            for i in range(getattr(ctx, "retrieval_rounds", 1))
+        ]
+
+    def _extract_chunks(self, ctx) -> list[dict]:
+        chunks = []
+        for c in ctx.all_chunks:
+            if isinstance(c, dict):
+                chunks.append({
+                    "chunk_id": c.get("chunk_id", ""),
+                    "text": c.get("text", ""),
+                    "source": c.get("metadata", {}).get("source", "") if isinstance(c.get("metadata"), dict) else "",
+                    "fused_score": float(c.get("fused_score", 0)),
+                    "vector_score": float(c.get("vector_score", 0)),
+                    "bm25_score": float(c.get("bm25_score", 0)),
+                    "rerank_score": float(c.get("rerank_score", 0)),
+                    "rank": int(c.get("rank", 0)),
+                    "retrieval_method": c.get("retrieval_method", ""),
+                })
+            else:
+                chunks.append({"chunk_id": str(getattr(c, "chunk_id", ""))})
+        return chunks
+
+    def _extract_reflection_rounds(self, ctx) -> list[dict]:
+        results = []
+        for r in getattr(ctx, "reflection_results", []):
+            dec = r.decision.value if hasattr(r.decision, "value") else str(r.decision)
+            results.append({
+                "round_id": len(results),
+                "decision": dec,
+                "confidence_score": float(r.confidence_score),
+                "missing_aspects": list(r.missing_aspects) if hasattr(r, "missing_aspects") else [],
+                "supplementary_queries": list(r.supplementary_queries) if hasattr(r, "supplementary_queries") else [],
+                "reasoning": getattr(r, "reasoning", ""),
+            })
+        return results
+
+    def _extract_verification(self, ctx) -> Optional[dict]:
+        v = getattr(ctx, "verification", None)
+        if v is None:
+            return None
+        dec = v.decision.value if hasattr(v.decision, "value") else str(v.decision)
+        return {
+            "decision": dec,
+            "faithfulness_score": float(getattr(v, "faithfulness_score", 0)),
+            "has_hallucination": bool(getattr(v, "has_hallucination", False)),
+            "citation_accuracy": float(getattr(v, "citation_accuracy", 0)),
+            "issues": list(getattr(v, "issues", [])),
+            "revised_answer": getattr(v, "revised_answer", None),
+        }
+
+    def _extract_stage_latencies(self, ctx) -> dict:
+        return getattr(ctx, "stage_latencies", {})
+
+    # ── persistence ───────────────────────────────────────────────────────────
+
     def _save_trace(self, trace: RAGTrace):
         conn = _get_connection()
         try:
             conn.execute(
                 """INSERT OR REPLACE INTO traces
-                   (trace_id, query, query_type, timestamp, state_history, planning_steps,
-                    reflection_rounds, retrieval_rounds, total_chunks_retrieved, generation,
-                    verification, answer, sources_count, total_latency_ms, error)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   (trace_id, query, query_type, timestamp, query_analysis, planning,
+                    rewritten_queries, state_history, retrieval_rounds, all_chunks,
+                    total_chunks_retrieved, reflection_rounds_detail, reflection_rounds,
+                    generation, verification, answer, sources_count, stage_latencies,
+                    total_latency_ms, error)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     trace.trace_id,
                     trace.query,
                     trace.query_type,
                     trace.timestamp,
+                    json.dumps(trace.query_analysis, ensure_ascii=False),
+                    json.dumps(trace.planning, ensure_ascii=False),
+                    json.dumps(trace.rewritten_queries, ensure_ascii=False),
                     json.dumps(trace.state_history, ensure_ascii=False),
-                    json.dumps(trace.planning_steps, ensure_ascii=False),
-                    trace.reflection_rounds,
                     json.dumps(trace.retrieval_rounds, ensure_ascii=False),
+                    json.dumps(trace.all_chunks, ensure_ascii=False),
                     trace.total_chunks_retrieved,
+                    json.dumps(trace.reflection_rounds_detail, ensure_ascii=False),
+                    trace.reflection_rounds,
                     json.dumps(trace.generation, ensure_ascii=False) if trace.generation else None,
                     json.dumps(trace.verification, ensure_ascii=False) if trace.verification else None,
                     trace.answer,
                     trace.sources_count,
+                    json.dumps(trace.stage_latencies, ensure_ascii=False),
                     trace.total_latency_ms,
                     trace.error,
                 ),
@@ -299,12 +554,7 @@ class RAGTracer:
                 (trace_id,),
             ).fetchone()
             if row:
-                result = dict(row)
-                for key in ("state_history", "planning_steps", "retrieval_rounds",
-                            "generation", "verification"):
-                    if result.get(key) and isinstance(result[key], str):
-                        result[key] = json.loads(result[key])
-                return result
+                return self._row_to_trace(row)
             return None
         finally:
             conn.close()
@@ -326,17 +576,22 @@ class RAGTracer:
             params.extend([limit, skip])
 
             rows = conn.execute(sql, params).fetchall()
-            traces = []
-            for r in rows:
-                trace = dict(r)
-                for key in ("state_history", "planning_steps", "retrieval_rounds",
-                            "generation", "verification"):
-                    if trace.get(key) and isinstance(trace[key], str):
-                        trace[key] = json.loads(trace[key])
-                traces.append(trace)
-            return traces
+            return [self._row_to_trace(r) for r in rows]
         finally:
             conn.close()
+
+    def _row_to_trace(self, row: sqlite3.Row) -> dict:
+        trace = dict(row)
+        for key in (
+            "query_analysis", "planning", "rewritten_queries",
+            "state_history", "retrieval_rounds", "all_chunks",
+            "reflection_rounds_detail", "generation", "verification",
+            "stage_latencies",
+        ):
+            val = trace.get(key)
+            if val and isinstance(val, str):
+                trace[key] = json.loads(val)
+        return trace
 
     def get_metrics(
         self,
@@ -464,7 +719,7 @@ class RAGTracer:
             rows = conn.execute(
                 "SELECT * FROM traces ORDER BY id DESC"
             ).fetchall()
-            return [dict(r) for r in rows]
+            return [self._row_to_trace(r) for r in rows]
         finally:
             conn.close()
 
