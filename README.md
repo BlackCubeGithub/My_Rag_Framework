@@ -16,10 +16,10 @@
 
 ## Tech Stack
 
-- **语言模型**: OpenAI GPT 系列 / Claude / 本地模型
-- **向量数据库**: FAISS / Chroma / Milvus / pgvector
-- **Embedding**: sentence-transformers / OpenAI Embedding
-- **框架**: LangChain / LangChain-Chatchat
+- **语言模型**: DeepSeek-V4-Pro
+- **向量数据库**: Chroma
+- **Embedding**: Qwen
+- **框架**: LangChain
 - **评估**: RAGAS
 
 ## Research Scope
